@@ -1,758 +1,407 @@
-import collections
-import json
-import random
-import threading
-import time
-from datetime import datetime, timezone
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from collections import Counter
+import json
+import time
+from websocket import create_connection
+from datetime import datetime
 
-try:
-    import websocket
-    HAS_WEBSOCKET = True
-except ImportError:
-    HAS_WEBSOCKET = False
-
-
-# ============================================================
-# DERIV DIGIT SCANNER V2
-# Educational analysis tool
-# ============================================================
-
+# -----------------------------
+# Page Config
+# -----------------------------
 st.set_page_config(
-    page_title="Deriv Digit Scanner V2",
-    page_icon="📊",
-    layout="wide"
+    page_title="MATRIX Digit Scanner Pro",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-SYMBOLS = [
-    "R_10",
-    "R_25",
-    "R_50",
-    "R_75",
-    "R_100",
-    "R_10_1s",
-    "R_25_1s",
-    "R_50_1s",
-    "R_75_1s",
-    "R_100_1s",
-]
+# Custom CSS
+st.markdown("""
+<style>
+    .stApp { background-color: #0b0f19; color: #e0e0e0; }
+    .signal-box {
+        background: linear-gradient(135deg, #0f172a, #1e293b);
+        border: 1px solid #22c55e55;
+        border-radius: 16px;
+        padding: 22px;
+        text-align: center;
+    }
+    .signal-text {
+        font-size: 2.1rem;
+        font-weight: 800;
+        color: #22c55e;
+        margin: 0;
+    }
+    .confidence-text {
+        font-size: 1.5rem;
+        color: #fbbf24;
+        margin-top: 6px;
+    }
+    .metric-card {
+        background: #1e293b;
+        border-radius: 12px;
+        padding: 14px;
+        text-align: center;
+        border: 1px solid #334155;
+    }
+    .section-title {
+        font-size: 1.3rem;
+        font-weight: 600;
+        margin-top: 10px;
+        margin-bottom: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
+# -----------------------------
+# Markets
+# -----------------------------
+MARKETS = {
+    "Volatility 10": "R_10",
+    "Volatility 25": "R_25",
+    "Volatility 50": "R_50",
+    "Volatility 75": "R_75",
+    "Volatility 100": "R_100",
+    "Volatility 10 (1s)": "1HZ10V",
+    "Volatility 25 (1s)": "1HZ25V",
+    "Volatility 50 (1s)": "1HZ50V",
+    "Volatility 75 (1s)": "1HZ75V",
+    "Volatility 100 (1s)": "1HZ100V",
+}
 
-def get_last_digit(price):
-    """
-    Extract the final visible digit from a price.
-    """
-    text = f"{float(price):.10f}".rstrip("0").rstrip(".")
+# -----------------------------
+# Deriv API
+# -----------------------------
+def get_ticks_history(symbol: str, count: int = 100):
+    try:
+        ws = create_connection(
+            "wss://ws.derivws.com/websockets/v3?app_id=1089",
+            timeout=12
+        )
+        request = {
+            "ticks_history": symbol,
+            "adjust_start_time": 1,
+            "count": count,
+            "end": "latest",
+            "start": 1,
+            "style": "ticks"
+        }
+        ws.send(json.dumps(request))
+        result = json.loads(ws.recv())
+        ws.close()
 
-    if "." not in text:
-        return int(text[-1])
-
-    return int(text[-1])
-
-
-def analyse_window(ticks, window):
-    """
-    Analyse digit frequency in the selected tick window.
-    """
-
-    if len(ticks) < window:
+        if "history" in result and "prices" in result["history"]:
+            return result["history"]["prices"]
+        return None
+    except Exception as e:
+        st.error(f"API Error: {e}")
         return None
 
-    recent = ticks[-window:]
-    digits = [get_last_digit(x) for x in recent]
 
-    counter = collections.Counter(digits)
+def extract_last_digits(prices):
+    digits = []
+    for p in prices:
+        s = f"{float(p):.2f}"
+        digit = int(s.split(".")[0][-1])
+        digits.append(digit)
+    return digits
 
-    results = []
 
-    for digit in range(10):
-        count = counter.get(digit, 0)
-        percentage = (count / window) * 100
-        deviation = percentage - 10
+def analyze_digits(digits):
+    if not digits or len(digits) < 10:
+        return None
 
-        results.append({
-            "digit": digit,
-            "count": count,
-            "percentage": percentage,
-            "deviation": deviation
-        })
+    counter = Counter(digits)
+    total = len(digits)
+    freq = {d: (counter.get(d, 0) / total) * 100 for d in range(10)}
 
-    hottest = max(results, key=lambda x: x["deviation"])
-    coldest = min(results, key=lambda x: x["deviation"])
+    sorted_freq = sorted(freq.items(), key=lambda x: x[1])
+    coldest = sorted_freq[0]
+    hottest = sorted_freq[-1]
 
-    even = sum(1 for d in digits if d % 2 == 0)
-    odd = window - even
+    even_count = sum(counter.get(d, 0) for d in [0, 2, 4, 6, 8])
+    even_pct = (even_count / total) * 100
+    odd_pct = 100 - even_pct
 
-    even_pct = even / window * 100
-    odd_pct = odd / window * 100
+    over_count = sum(counter.get(d, 0) for d in [5, 6, 7, 8, 9])
+    over_pct = (over_count / total) * 100
+    under_pct = 100 - over_pct
 
-    over = sum(1 for d in digits if d > 4)
-    under = sum(1 for d in digits if d < 5)
-
-    over_pct = over / window * 100
-    under_pct = under / window * 100
+    max_dev = max(abs(f - 10) for f in freq.values())
+    confidence = min(97.5, round(50 + max_dev * 4.2, 1))
 
     return {
-        "window": window,
-        "digits": digits,
-        "frequency": results,
-        "hottest": hottest,
+        "freq": freq,
         "coldest": coldest,
+        "hottest": hottest,
         "even_pct": even_pct,
         "odd_pct": odd_pct,
         "over_pct": over_pct,
-        "under_pct": under_pct
+        "under_pct": under_pct,
+        "confidence": confidence,
+        "sample_size": total,
+        "last_digit": digits[-1],
+        "digits": digits
     }
 
 
-def consensus_score(analyses):
-    """
-    Creates an experimental scanner score.
+# -----------------------------
+# Sidebar
+# -----------------------------
+st.sidebar.title("⚙️ MATRIX Settings")
 
-    This is NOT a probability of the next digit.
-    """
+market_name = st.sidebar.selectbox("Market", list(MARKETS.keys()), index=4)
+symbol = MARKETS[market_name]
 
-    if not analyses:
-        return None
-
-    digit_scores = {d: 0 for d in range(10)}
-
-    weights = {
-        50: 1.0,
-        100: 1.5,
-        200: 2.0
-    }
-
-    for window, analysis in analyses.items():
-
-        if not analysis:
-            continue
-
-        weight = weights.get(window, 1)
-
-        for row in analysis["frequency"]:
-            digit = row["digit"]
-            deviation = row["deviation"]
-
-            digit_scores[digit] += deviation * weight
-
-    best_digit = max(
-        digit_scores,
-        key=digit_scores.get
-    )
-
-    worst_digit = min(
-        digit_scores,
-        key=digit_scores.get
-    )
-
-    maximum = max(digit_scores.values())
-    minimum = min(digit_scores.values())
-
-    spread = maximum - minimum
-
-    if spread <= 0:
-        score = 50
-    else:
-        score = 50 + min(49, abs(digit_scores[best_digit]) / spread * 49)
-
-    return {
-        "digit_scores": digit_scores,
-        "best_digit": best_digit,
-        "worst_digit": worst_digit,
-        "score": round(score)
-    }
-
-
-# ============================================================
-# LIVE DERIV COLLECTOR
-# ============================================================
-
-class DerivCollector:
-
-    def __init__(self, symbol):
-        self.symbol = symbol
-        self.ticks = []
-        self.running = False
-        self.ws = None
-        self.lock = threading.Lock()
-        self.thread = None
-
-    def on_message(self, ws, message):
-
-        try:
-            data = json.loads(message)
-
-            if "tick" in data:
-
-                price = float(
-                    data["tick"]["quote"]
-                )
-
-                with self.lock:
-
-                    self.ticks.append(price)
-
-                    if len(self.ticks) > 1000:
-                        self.ticks = self.ticks[-1000:]
-
-        except Exception:
-            pass
-
-    def on_error(self, ws, error):
-        pass
-
-    def on_close(self, ws, *args):
-        self.running = False
-
-    def on_open(self, ws):
-
-        request = {
-            "ticks": self.symbol,
-            "subscribe": 1
-        }
-
-        ws.send(json.dumps(request))
-
-    def run(self):
-
-        url = (
-            "wss://ws.derivws.com/"
-            "websockets/v3?app_id=1089"
-        )
-
-        self.ws = websocket.WebSocketApp(
-            url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-
-        self.ws.run_forever(
-            ping_interval=20,
-            ping_timeout=10
-        )
-
-    def start(self):
-
-        if not HAS_WEBSOCKET:
-            return False
-
-        if self.running:
-            return True
-
-        self.running = True
-
-        self.thread = threading.Thread(
-            target=self.run,
-            daemon=True
-        )
-
-        self.thread.start()
-
-        return True
-
-    def stop(self):
-
-        self.running = False
-
-        if self.ws:
-
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-
-    def get_ticks(self):
-
-        with self.lock:
-            return list(self.ticks)
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "collector" not in st.session_state:
-    st.session_state.collector = None
-
-if "demo_ticks" not in st.session_state:
-
-    base = 1000.0
-
-    st.session_state.demo_ticks = [
-        base + random.uniform(-1, 1)
-        for _ in range(300)
-    ]
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("⚙️ Scanner Settings")
+tick_count = st.sidebar.select_slider("Ticks to analyze", [50, 75, 100, 150, 200], value=100)
 
 mode = st.sidebar.radio(
-    "Data source",
-    [
-        "Live Deriv",
-        "Demo"
-    ]
+    "Signal Mode",
+    ["Matches / Differs", "Even / Odd", "Over / Under"],
+    index=0
 )
 
-symbol = st.sidebar.selectbox(
-    "Market",
-    SYMBOLS,
-    index=4
-)
-
-refresh = st.sidebar.slider(
-    "Refresh seconds",
-    2,
-    15,
-    5
-)
+auto_refresh = st.sidebar.checkbox("Auto-refresh every 5s", value=True)
+scan_btn = st.sidebar.button("🔄 Run Deep Scan", use_container_width=True, type="primary")
 
 st.sidebar.markdown("---")
-
-st.sidebar.info(
-    "This scanner measures recent digit frequency. "
-    "It does NOT guarantee the next digit."
+st.sidebar.warning(
+    "Statistical analysis only.\n"
+    "Volatility Indices are randomly generated.\n"
+    "No strategy guarantees profit. Trade responsibly."
 )
 
+# -----------------------------
+# Session State
+# -----------------------------
+if "analysis" not in st.session_state:
+    st.session_state.analysis = None
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "trades" not in st.session_state:
+    st.session_state.trades = []          # Win/Loss tracker
+if "last_update" not in st.session_state:
+    st.session_state.last_update = None
 
-# ============================================================
-# HEADER
-# ============================================================
+# -----------------------------
+# Main Title
+# -----------------------------
+st.title("📡 MATRIX Digit Scanner Pro")
+st.caption("Matches • Differs • Martingale • Target Profit • Win/Loss Tracker")
 
-st.title("📊 Deriv Digit Scanner V2")
+# Fetch data
+if scan_btn or auto_refresh or st.session_state.analysis is None:
+    with st.spinner(f"Scanning {market_name}..."):
+        prices = get_ticks_history(symbol, tick_count)
+        if prices:
+            digits = extract_last_digits(prices)
+            analysis = analyze_digits(digits)
+            st.session_state.analysis = analysis
+            st.session_state.last_update = datetime.now().strftime("%H:%M:%S")
 
-st.caption(
-    "Live market analysis • Multi-window frequency scanner • "
-    "Experimental scoring"
-)
+            if analysis:
+                if mode == "Matches / Differs":
+                    signal = f"MATCHES {analysis['coldest'][0]}"
+                elif mode == "Even / Odd":
+                    signal = "EVEN" if analysis["even_pct"] < 48 else "ODD"
+                else:
+                    signal = "UNDER" if analysis["under_pct"] < 48 else "OVER"
 
+                st.session_state.history.insert(0, {
+                    "Time": st.session_state.last_update,
+                    "Market": market_name,
+                    "Signal": signal,
+                    "Confidence": analysis["confidence"],
+                    "Last Digit": analysis["last_digit"]
+                })
+                st.session_state.history = st.session_state.history[:12]
 
-# ============================================================
-# LIVE CONTROLS
-# ============================================================
+analysis = st.session_state.analysis
 
-c1, c2, c3 = st.columns(3)
+if analysis:
+    # ===== LIVE SIGNAL =====
+    col1, col2 = st.columns([1.5, 1])
 
-with c1:
+    with col1:
+        st.markdown("### 🎯 Live Signal")
 
-    if st.button(
-        "▶️ Start Scanner",
-        use_container_width=True
-    ):
-
-        if mode == "Live Deriv":
-
-            if st.session_state.collector:
-                st.session_state.collector.stop()
-
-            collector = DerivCollector(symbol)
-
-            if collector.start():
-
-                st.session_state.collector = collector
-
-                st.success(
-                    f"Connected to {symbol}"
-                )
-
-            else:
-
-                st.error(
-                    "websocket-client is not installed."
-                )
-
+        if mode == "Matches / Differs":
+            main_signal = f"MATCHES {analysis['coldest'][0]}"
+            alt = f"Alt: DIFFERS {analysis['hottest'][0]}"
+        elif mode == "Even / Odd":
+            main_signal = "EVEN" if analysis["even_pct"] < 48 else "ODD"
+            alt = f"Even {analysis['even_pct']:.1f}% | Odd {analysis['odd_pct']:.1f}%"
         else:
+            main_signal = "UNDER 5" if analysis["under_pct"] < 48 else "OVER 5"
+            alt = f"Under {analysis['under_pct']:.1f}% | Over {analysis['over_pct']:.1f}%"
 
-            st.success(
-                "Demo scanner started."
-            )
+        st.markdown(f"""
+        <div class="signal-box">
+            <p class="signal-text">{main_signal}</p>
+            <p class="confidence-text">{analysis['confidence']}% Confidence</p>
+            <p style="color:#94a3b8; margin-top:6px;">{alt}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-
-with c2:
-
-    if st.button(
-        "⏹ Stop",
-        use_container_width=True
-    ):
-
-        if st.session_state.collector:
-
-            st.session_state.collector.stop()
-
-            st.session_state.collector = None
-
-        st.info("Scanner stopped.")
-
-
-with c3:
-
-    auto_refresh = st.checkbox(
-        "Auto refresh",
-        value=True
-    )
-
-
-# ============================================================
-# GET TICKS
-# ============================================================
-
-if mode == "Live Deriv":
-
-    if st.session_state.collector:
-
-        ticks = (
-            st.session_state
-            .collector
-            .get_ticks()
-        )
-
-    else:
-
-        ticks = []
-
-else:
-
-    last = (
-        st.session_state
-        .demo_ticks[-1]
-    )
-
-    new_price = (
-        last +
-        random.uniform(-0.05, 0.05)
-    )
-
-    st.session_state.demo_ticks.append(
-        new_price
-    )
-
-    if len(st.session_state.demo_ticks) > 1000:
-
-        st.session_state.demo_ticks = (
-            st.session_state.demo_ticks[-1000:]
-        )
-
-    ticks = st.session_state.demo_ticks
-
-
-# ============================================================
-# STATUS
-# ============================================================
-
-st.markdown("### 📡 Feed Status")
-
-status1, status2, status3 = st.columns(3)
-
-with status1:
-    st.metric(
-        "Market",
-        symbol if mode == "Live Deriv" else "DEMO"
-    )
-
-with status2:
-    st.metric(
-        "Ticks collected",
-        len(ticks)
-    )
-
-with status3:
-    st.metric(
-        "Data source",
-        mode
-    )
-
-
-if len(ticks) < 50:
-
-    st.warning(
-        f"Collecting data... {len(ticks)}/50 ticks"
-    )
-
-else:
-
-    # ========================================================
-    # MULTI WINDOW ANALYSIS
-    # ========================================================
-
-    analyses = {}
-
-    for window in [50, 100, 200]:
-
-        analyses[window] = analyse_window(
-            ticks,
-            window
-        )
-
-
-    # ========================================================
-    # CONSENSUS
-    # ========================================================
-
-    consensus = consensus_score(
-        analyses
-    )
+    with col2:
+        st.markdown("### 📊 Market Info")
+        st.metric("Market", market_name)
+        st.metric("Last Digit", analysis["last_digit"])
+        st.metric("Ticks Analyzed", analysis["sample_size"])
+        st.caption(f"Updated: {st.session_state.last_update}")
 
     st.markdown("---")
 
-    st.markdown(
-        "## 🎯 Experimental Consensus"
-    )
+    # ===== MARTINGALE + TARGET PROFIT =====
+    st.markdown('<p class="section-title">📈 Martingale & Target Profit</p>', unsafe_allow_html=True)
 
-    cc1, cc2, cc3 = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        base_stake = st.number_input("Base Stake ($)", min_value=0.35, value=1.00, step=0.35)
+    with col_b:
+        multiplier = st.number_input("Multiplier", min_value=1.5, value=2.0, step=0.1)
+    with col_c:
+        max_steps = st.number_input("Max Steps", min_value=3, value=6, step=1)
+    with col_d:
+        martingale_type = st.selectbox("Type", ["Classic Martingale", "Anti-Martingale"])
 
-    with cc1:
+    # Target Profit Calculator
+    st.markdown("#### 🎯 Target Profit Calculator")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1:
+        target_profit = st.number_input("Target Profit ($)", min_value=1.0, value=10.0, step=1.0)
+    with col_t2:
+        payout_rate = st.number_input("Payout Rate (e.g. 0.95)", min_value=0.5, value=0.95, step=0.01)
+    with col_t3:
+        win_rate_needed = st.number_input("Assumed Win Rate %", min_value=40.0, value=55.0, step=1.0)
 
-        st.metric(
-            "Consensus Digit",
-            str(consensus["best_digit"])
-        )
+    # Calculate required wins roughly
+    avg_win = base_stake * payout_rate
+    wins_needed = int(np.ceil(target_profit / avg_win)) if avg_win > 0 else 0
 
-    with cc2:
+    st.info(f"To reach **${target_profit:.2f}** profit you need approximately **{wins_needed}** winning trades "
+            f"(at ${base_stake} stake & {payout_rate*100:.0f}% payout).")
 
-        st.metric(
-            "Experimental Score",
-            f"{consensus['score']}/100"
-        )
+    # Martingale Progression
+    progression = []
+    stake = base_stake
+    cumulative = 0.0
 
-    with cc3:
-
-        st.metric(
-            "Least Frequent",
-            str(consensus["worst_digit"])
-        )
-
-
-    st.info(
-        "The score measures agreement between recent "
-        "frequency samples. It is NOT an 80% prediction "
-        "of the next tick."
-    )
-
-
-    # ========================================================
-    # WINDOW TABLE
-    # ========================================================
-
-    st.markdown("## 📈 Multi-Window Analysis")
-
-    table = []
-
-    for window in [50, 100, 200]:
-
-        result = analyses[window]
-
-        if result:
-
-            table.append({
-                "Window": window,
-                "Hottest": result["hottest"]["digit"],
-                "Hot %": round(
-                    result["hottest"]["percentage"],
-                    1
-                ),
-                "Coldest": result["coldest"]["digit"],
-                "Cold %": round(
-                    result["coldest"]["percentage"],
-                    1
-                ),
-                "Even %": round(
-                    result["even_pct"],
-                    1
-                ),
-                "Odd %": round(
-                    result["odd_pct"],
-                    1
-                ),
-                "Over %": round(
-                    result["over_pct"],
-                    1
-                ),
-                "Under %": round(
-                    result["under_pct"],
-                    1
-                )
-            })
-
-    st.dataframe(
-        pd.DataFrame(table),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-    # ========================================================
-    # DIGIT HEATMAP
-    # ========================================================
-
-    st.markdown("## 🔢 Digit Heatmap")
-
-    analysis = analyses[100]
-
-    cols = st.columns(10)
-
-    for row in analysis["frequency"]:
-
-        digit = row["digit"]
-        pct = row["percentage"]
-        deviation = row["deviation"]
-
-        if deviation >= 6:
-            label = "🔥 VERY HOT"
-
-        elif deviation >= 3:
-            label = "🟠 HOT"
-
-        elif deviation <= -6:
-            label = "❄️ VERY COLD"
-
-        elif deviation <= -3:
-            label = "🔵 COLD"
-
+    for i in range(int(max_steps)):
+        cumulative += stake
+        progression.append({
+            "Step": i + 1,
+            "Stake": round(stake, 2),
+            "Cumulative Risk": round(cumulative, 2)
+        })
+        if martingale_type == "Classic Martingale":
+            stake *= multiplier          # increase after loss
         else:
-            label = "⚪ NEUTRAL"
+            stake = base_stake           # Anti keeps base or you can customize
 
-        with cols[digit]:
+    st.dataframe(pd.DataFrame(progression), use_container_width=True, hide_index=True)
+    st.caption(f"Total risk after {max_steps} consecutive losses: **${cumulative:.2f}**")
 
-            st.metric(
-                str(digit),
-                f"{pct:.1f}%"
-            )
+    st.markdown("---")
 
-            st.caption(label)
+    # ===== WIN / LOSS TRACKER =====
+    st.markdown('<p class="section-title">📝 Simple Win / Loss Tracker</p>', unsafe_allow_html=True)
 
+    col_w1, col_w2, col_w3 = st.columns([1, 1, 2])
+    with col_w1:
+        if st.button("✅ Register WIN", use_container_width=True):
+            st.session_state.trades.append({"Result": "WIN", "Time": datetime.now().strftime("%H:%M:%S")})
+    with col_w2:
+        if st.button("❌ Register LOSS", use_container_width=True):
+            st.session_state.trades.append({"Result": "LOSS", "Time": datetime.now().strftime("%H:%M:%S")})
 
-    # ========================================================
-    # OVER / UNDER
-    # ========================================================
+    if st.session_state.trades:
+        trades_df = pd.DataFrame(st.session_state.trades)
+        wins = len(trades_df[trades_df["Result"] == "WIN"])
+        losses = len(trades_df[trades_df["Result"] == "LOSS"])
+        total = wins + losses
+        winrate = (wins / total * 100) if total > 0 else 0
 
-    st.markdown("## ↕️ Over / Under")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Wins", wins)
+        c2.metric("Losses", losses)
+        c3.metric("Total Trades", total)
+        c4.metric("Win Rate", f"{winrate:.1f}%")
 
-    ou1, ou2, ou3 = st.columns(3)
+        with st.expander("Trade Log"):
+            st.dataframe(trades_df.iloc[::-1], use_container_width=True, hide_index=True)
 
-    with ou1:
+        if st.button("Clear Tracker"):
+            st.session_state.trades = []
+            st.rerun()
+    else:
+        st.info("No trades registered yet. Use the buttons above after each trade.")
 
-        st.metric(
-            "OVER 4",
-            f"{analysis['over_pct']:.1f}%"
-        )
+    st.markdown("---")
 
-    with ou2:
+    # ===== FREQUENCY CHART =====
+    st.subheader("Digit Frequency Distribution")
+    freq_df = pd.DataFrame({
+        "Digit": list(analysis["freq"].keys()),
+        "Frequency %": list(analysis["freq"].values())
+    })
+    fig = px.bar(freq_df, x="Digit", y="Frequency %", color="Frequency %",
+                 color_continuous_scale="teal", text_auto=".1f")
+    fig.update_layout(template="plotly_dark", height=360, margin=dict(t=20, b=20), xaxis=dict(dtick=1))
+    fig.add_hline(y=10, line_dash="dash", line_color="#64748b", annotation_text="Expected 10%")
+    st.plotly_chart(fig, use_container_width=True)
 
-        st.metric(
-            "UNDER 5",
-            f"{analysis['under_pct']:.1f}%"
-        )
+    # ===== HOT / COLD CARDS =====
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#60a5fa">❄️ Coldest</div>
+            <h2>{analysis['coldest'][0]}</h2>
+            <small>{analysis['coldest'][1]:.1f}%</small>
+        </div>
+        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="color:#f87171">🔥 Hottest</div>
+            <h2>{analysis['hottest'][0]}</h2>
+            <small>{analysis['hottest'][1]:.1f}%</small>
+        </div>
+        """, unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div>Even / Odd</div>
+            <h3>{analysis['even_pct']:.1f}% / {analysis['odd_pct']:.1f}%</h3>
+        </div>
+        """, unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div>Under / Over</div>
+            <h3>{analysis['under_pct']:.1f}% / {analysis['over_pct']:.1f}%</h3>
+        </div>
+        """, unsafe_allow_html=True)
 
-    with ou3:
+    # ===== SIGNAL HISTORY =====
+    st.markdown("---")
+    st.subheader("📜 Signal History")
+    if st.session_state.history:
+        st.dataframe(pd.DataFrame(st.session_state.history), use_container_width=True, hide_index=True)
+    else:
+        st.info("No signals yet.")
 
-        difference = (
-            analysis["over_pct"]
-            -
-            analysis["under_pct"]
-        )
+    with st.expander("Last 40 digits"):
+        st.code("  ".join(map(str, analysis["digits"][-40:])))
 
-        if difference > 8:
-            bias = "OVER"
+else:
+    st.info("Click **Run Deep Scan** to begin analysis.")
 
-        elif difference < -8:
-            bias = "UNDER"
-
-        else:
-            bias = "NONE"
-
-        st.metric(
-            "Recent Bias",
-            bias
-        )
-
-
-    # ========================================================
-    # EVEN / ODD
-    # ========================================================
-
-    st.markdown("## ⚖️ Even / Odd")
-
-    eo1, eo2, eo3 = st.columns(3)
-
-    with eo1:
-        st.metric(
-            "EVEN",
-            f"{analysis['even_pct']:.1f}%"
-        )
-
-    with eo2:
-        st.metric(
-            "ODD",
-            f"{analysis['odd_pct']:.1f}%"
-        )
-
-    with eo3:
-
-        difference = (
-            analysis["even_pct"] - 50
-        )
-
-        if difference > 8:
-            bias = "EVEN"
-
-        elif difference < -8:
-            bias = "ODD"
-
-        else:
-            bias = "NONE"
-
-        st.metric(
-            "Bias",
-            bias
-        )
-
-
-    # ========================================================
-    # RECENT DIGITS
-    # ========================================================
-
-    st.markdown("## 🧾 Last 30 Digits")
-
-    recent_digits = [
-        get_last_digit(x)
-        for x in ticks[-30:]
-    ]
-
-    st.code(
-        " ".join(
-            str(x)
-            for x in recent_digits
-        )
-    )
-
-
-    # ========================================================
-    # IMPORTANT DISCLAIMER
-    # ========================================================
-
-    st.warning(
-        "⚠️ Educational analysis only. "
-        "Recent frequency imbalance does not establish "
-        "the outcome of the next tick. Test any strategy "
-        "on a Deriv DEMO account before risking money."
-    )
-
-
-# ============================================================
-# AUTO REFRESH
-# ============================================================
-
-if auto_refresh:
-
-    time.sleep(refresh)
-
+# Auto refresh
+if auto_refresh and analysis:
+    time.sleep(5)
     st.rerun()
